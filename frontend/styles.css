@@ -1,0 +1,23 @@
+/* ページ全体を700x700の大きさに固定 */
+html,
+body {
+    margin: 0;
+    padding: 0;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    justify-content: center;
+    /* 水平方向中央 */
+    align-items: center;
+    /* 垂直方向中央 */
+    overflow: hidden;
+    /* はみ出しを防止 */
+    background-color: #f0f0f0;
+    /* 背景色（任意） */
+}
+
+canvas {
+    display: block;
+    width: 700px;
+    height: 700px;
+}

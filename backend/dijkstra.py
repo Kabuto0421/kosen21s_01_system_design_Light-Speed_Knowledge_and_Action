@@ -7,14 +7,14 @@ import numpy as np
 import copy  # deepcopy を使う
 
 # ==== シリアルポート設定 ====
-COM_PORT_MOTOR = "/dev/tty.ESP32_MotorControl05"
+COM_PORT_MOTOR = "/dev/tty.ESP32_Motordenkouchidou"
 COM_PORT_LED1  = "/dev/tty.ESP32_LED_Control_1"
 COM_PORT_LED2  = "/dev/tty.ESP32_LED_Control_2_ver2"
 BAUD_RATE = 115200
 
 # ======= グローバル変数（有効/無効のフラグ） =======
-MOTOR_ENABLED = False   # TrueならモーターESP32を使う
-LED1_ENABLED  = False   # TrueならLED1 ESP32を使う
+MOTOR_ENABLED = True  # TrueならモーターESP32を使う
+LED1_ENABLED  = True   # TrueならLED1 ESP32を使う
 LED2_ENABLED  = True  # TrueならLED2 ESP32を使う(テスト時にOFF)
 
 # ======= グローバル変数（シリアルオブジェクト） =======
@@ -228,7 +228,7 @@ async def monitor_and_respond(graph, path):
 
             # 左右旋回の場合は一定時間後に straight を送る (例)
             if action in ["right", "left"]:
-                await asyncio.sleep(1)
+                await asyncio.sleep(1.45)
                 send_command_motor("straight")
                 print("3秒後に straight を送信")
 

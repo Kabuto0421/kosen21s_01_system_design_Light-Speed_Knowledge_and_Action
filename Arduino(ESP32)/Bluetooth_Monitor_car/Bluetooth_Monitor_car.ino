@@ -1,13 +1,13 @@
 #include <BluetoothSerial.h> // Bluetoothシリアル通信ライブラリ
-BluetoothSerial SerialBT;    // Bluetoothシリアル通信のインスタンス作成
+BluetoothSerial SerialBT;    // Bluetoothシリアル通信のインスタンス
 
 // ==================
 // モーター制御用ピン（4ピン使用）
 // ==================
-const int m1Pin1 = 19; // ドライバ1(左モータ)のIN1
-const int m1Pin2 = 23; // ドライバ1(左モータ)のIN2
-const int m2Pin1 = 18; // ドライバ2(右モータ)のIN1
-const int m2Pin2 = 21; // ドライバ2(右モータ)のIN2
+const int m1Pin1 = 19;
+const int m1Pin2 = 23;
+const int m2Pin1 = 18;
+const int m2Pin2 = 21;
 
 // ==================
 // 超音波センサ用ピン
@@ -17,61 +17,146 @@ const int ECHO1 = 26;
 const int TRIG2 = 32;
 const int ECHO2 = 33;
 const int MAX_WAIT = 20000;
-double sonic = 331.5 + (0.6 * 25); // 音速（気温25℃）
+double sonic = 331.5 + (0.6 * 25); // 気温25℃のとき
+int turnDelayTime = 1300;
 
 // ==================
-// 状態フラグ
+// 状態管理
 // ==================
-bool running = false; // 前進/後退など、走行中ならtrue
-bool turning = false; // 旋回中ならtrue
-
-// 「壁をまだ見つけていないので、壁が無くても止まらない」フラグ
+bool running = false;
+bool turning = false;
 bool ignoringWallCheck = true;
+
+// ==================
+// コマンド格納用
+// ==================
+// 例: "straight,left,straight,right" などを分割して配列に入れる
+#define MAX_COMMANDS 100
+String commandList[MAX_COMMANDS];
+int commandCount = 0;
+int currentIndex = 0;
+
+// ==================
+// プロトタイプ
+// ==================
+void forwardMotor();
+void backwardMotor();
+void rightTurnMotor();
+void leftTurnMotor();
+void stopMotor();
+double read_distance1();
+double read_distance2();
+void executeCommand(const String &cmd);
+void moveToNextCommandIfNeeded();
 
 void setup()
 {
-    SerialBT.begin("ESP32_Motordenkouchidou");
     Serial.begin(115200);
+    SerialBT.begin("ESP32_Motordenkouchidou");
     Serial.println("Bluetooth Serial started. Waiting for commands...");
 
-    // モーター制御ピンの初期化
     pinMode(m1Pin1, OUTPUT);
     pinMode(m1Pin2, OUTPUT);
     pinMode(m2Pin1, OUTPUT);
     pinMode(m2Pin2, OUTPUT);
 
-    // 超音波センサ用ピンの初期化
     pinMode(TRIG1, OUTPUT);
     pinMode(ECHO1, INPUT);
     pinMode(TRIG2, OUTPUT);
     pinMode(ECHO2, INPUT);
 
-    // 初期状態を完全停止
     stopMotor();
     running = false;
     turning = false;
-
-    // 最初は壁を「まだ」見つけていないので無視モードON
     ignoringWallCheck = true;
+
+    commandCount = 0;
+    currentIndex = 0;
 }
 
 void loop()
 {
-    // ==================
-    // A) Bluetoothコマンド受信
-    // ==================
+    // =======================
+    // 1) 新しいコマンド列(一行)が届いたら受け取り、解析する
+    // =======================
     if (SerialBT.available())
     {
-        uint8_t command = SerialBT.read();
-        Serial.print("[BT] Received Command: ");
-        Serial.println(command);
-        handleCommand(command);
+        // 1) 新しい行を読み込む
+        String line = SerialBT.readStringUntil('\n');
+        line.trim();
+        Serial.println("[BT] Received line:");
+        Serial.println(line);
+
+        if (line.startsWith("delay="))
+        {
+            String delayStr = line.substring(6); // "delay=" を除去し、数字部分を取得
+            turnDelayTime = delayStr.toInt();    // 数値化して変数にセット
+            Serial.print("turnDelayTime updated: ");
+            Serial.println(turnDelayTime);
+
+            // その後のパースやコマンド解析は実施しない。
+            // 「delay=xxx」 は単独コマンド扱いなので return で抜ける。
+            return;
+        }
+
+        // 2) stopコマンドの特例
+        if (line == "stop")
+        {
+            stopMotor();
+            running = false;
+            turning = false;
+            ignoringWallCheck = true;
+            commandCount = 0;
+            currentIndex = 0;
+            return; // 関数抜け
+        }
+
+        // 3) 新しい行をパースして commandList[] を再構築
+        commandCount = 0;
+        currentIndex = 0;
+        if (line.length() > 0)
+        {
+            int startIdx = 0;
+            while (true)
+            {
+                int commaPos = line.indexOf(',', startIdx);
+                if (commaPos == -1)
+                {
+                    // 最後の要素
+                    String cmd = line.substring(startIdx);
+                    cmd.trim();
+                    if (cmd.length() > 0 && commandCount < MAX_COMMANDS)
+                    {
+                        commandList[commandCount++] = cmd;
+                    }
+                    break;
+                }
+                else
+                {
+                    String cmd = line.substring(startIdx, commaPos);
+                    cmd.trim();
+                    if (cmd.length() > 0 && commandCount < MAX_COMMANDS)
+                    {
+                        commandList[commandCount++] = cmd;
+                    }
+                    startIdx = commaPos + 1;
+                }
+            }
+        }
+        Serial.print("Parsed commandCount = ");
+        Serial.println(commandCount);
+
+        // 4) コマンド数が1以上あれば最初を実行
+        if (commandCount > 0)
+        {
+            executeCommand(commandList[0]);
+        }
     }
 
-    // ==================
-    // B) 壁判定の流れ
-    // ==================
-    // 「走行中(running=true) かつ 旋回中でない(turning=false) とき」にのみ距離を読む
+    // =======================
+    // 2) 現在コマンドを実行中なら壁検知のチェックなどを行う
+    //    （running=true && turning=false のときに壁を検知 → 壁消失したらSTOP→次コマンド）
+    // =======================
     if (running && !turning)
     {
         double dist1 = read_distance1();
@@ -83,129 +168,165 @@ void loop()
         Serial.print("ignoringWallCheck: ");
         Serial.println(ignoringWallCheck);
 
-        // 1) ignoringWallCheck == true なら「まだ壁を見つけていない」状態
-        //    → もし壁が近い(dist <= 5.0)なら「壁を見つけた」と判断して ignoringWallCheck = false
         if (ignoringWallCheck)
         {
-            if (dist1 <= 10.0 && dist2 <= 10.0)
+            // まだ壁を見つけていない状態
+            if (dist1 <= 13.0 && dist2 <= 13.0)
             {
                 Serial.println(">> Found the wall! ignoringWallCheck -> false");
                 ignoringWallCheck = false;
             }
         }
-        // 2) ignoringWallCheck == false なら「壁を見つけた後の通常ロジック」
-        //    → 壁が無くなった(dist > 5.0)ら停止
         else
         {
-            // 壁消失とみなす閾値を 5.0 に
-            if (dist1 > 30.0 || dist2 > 30.0)
+            // 壁を見つけたあとは「壁が消失」(dist>30など)でストップ → 次コマンド
+            if (dist1 > 25.0 || dist2 > 25.0)
             {
-                Serial.println("No Wall Exist → Stop and Send '1' to Python");
-                handleCommand(3); // 停止コマンドを呼ぶ
-                if (SerialBT.connected())
-                {
-                    SerialBT.println("1");
-                }
+                Serial.println("No Wall → Stop and move to next command");
+                stopMotor();
+                delay(500);
+                running = false;
+                turning = false;
+                ignoringWallCheck = true;
+                moveToNextCommandIfNeeded();
             }
             else
             {
-                Serial.println("Wall Exist");
+                Serial.println("Wall exist");
             }
         }
     }
 
-    delay(200); // 適宜調整
+    delay(200);
 }
 
-// ==================
-// コマンド処理
-// ==================
-void handleCommand(uint8_t command)
+// =======================
+// コマンドを実行する関数
+// =======================
+void executeCommand(const String &cmd)
 {
-    switch (command)
+    Serial.print("Execute Command: ");
+    Serial.println(cmd);
+
+    if (cmd == "straight")
     {
-    case 0: // 前進
-        Serial.println("Forward");
-        forward();
-        running = true;
-        turning = false;
-        ignoringWallCheck = true; // 「まだ壁見つけてない」状態にリセット
-        break;
-    case 4: // 後退
-        Serial.println("Back");
-        backward();
+        forwardMotor();
         running = true;
         turning = false;
         ignoringWallCheck = true;
-        break;
-    case 1: // 右折
-        Serial.println("Turn Right");
-        rightTurn();
+    }
+    else if (cmd == "back")
+    {
+        backwardMotor();
+        running = true;
+        turning = false;
+        ignoringWallCheck = true;
+    }
+    else if (cmd == "left")
+    {
+        leftTurnMotor();
         running = false;
         turning = true;
-        // 旋回中は「壁チェックしない」ので ignoringWallCheck = ? は任意
-        // もし旋回の後すぐに「まだ壁見つけてない」扱いにしたいなら true
+        ignoringWallCheck = true; // 旋回中は壁チェックしない
+        delay(turnDelayTime);
+        stopMotor();
+        turning = false;
         ignoringWallCheck = true;
-        break;
-    case 2: // 左折
-        Serial.println("Turn Left");
-        leftTurn();
+
+        // 次のコマンドが straight でない場合は追加する
+        if (currentIndex < commandCount - 1 && commandList[currentIndex + 1] != "straight")
+        {
+            Serial.println("Auto-inserting 'straight' after left turn");
+            commandList[currentIndex + 1] = "straight";
+        }
+
+        moveToNextCommandIfNeeded();
+    }
+
+    else if (cmd == "right")
+    {
+        rightTurnMotor();
         running = false;
         turning = true;
         ignoringWallCheck = true;
-        break;
-    case 3: // 停止
-        Serial.println("Stop");
+        delay(turnDelayTime);
+        stopMotor();
+        turning = false;
+        ignoringWallCheck = true;
+
+        // 次のコマンドが straight でない場合は追加する
+        if (currentIndex < commandCount - 1 && commandList[currentIndex + 1] != "straight")
+        {
+            // Serial.println("Auto-inserting 'straight' after right turn");
+            // commandList[currentIndex + 1] = "straight";
+        }
+
+        moveToNextCommandIfNeeded();
+    }
+    else
+    {
+        // "stop" など未知コマンドの場合はとりあえず停止
         stopMotor();
         running = false;
         turning = false;
         ignoringWallCheck = true;
-        // 停止時に無視フラグをどうするかは運用次第
-        // 例えば false にしておけば「停止後すぐに壁が消えたら動き出す」みたいな変なことにならない
-        // ここでは true にしておき「改めて前進/後退するときに壁を探し直す」動きにしている
-        break;
-    default:
-        Serial.println("Unknown Command");
-        return;
+        moveToNextCommandIfNeeded();
     }
 }
 
-// ==================
-// モーター動作関数
-// ==================
-void forward()
+// =======================
+// 次のコマンドを実行する
+// =======================
+void moveToNextCommandIfNeeded()
 {
-    // 左モータ: 前進
+    currentIndex++;
+    if (currentIndex < commandCount)
+    {
+        // 次コマンドを実行
+        executeCommand(commandList[currentIndex]);
+    }
+    else
+    {
+        Serial.println("All commands finished");
+        // すべて終わったら念のため停止
+        stopMotor();
+        running = false;
+        turning = false;
+        ignoringWallCheck = true;
+    }
+}
 
+void forwardMotor()
+{
+    Serial.println("Motor: Forward");
     digitalWrite(m1Pin1, LOW);
     digitalWrite(m1Pin2, HIGH);
-    // 右モータ: 前進
     digitalWrite(m2Pin1, HIGH);
     digitalWrite(m2Pin2, LOW);
 }
 
-void backward()
+void backwardMotor()
 {
-    // 左モータ: 後退
+    Serial.println("Motor: Backward");
     digitalWrite(m1Pin1, LOW);
     digitalWrite(m1Pin2, HIGH);
-    // 右モータ: 後退
     digitalWrite(m2Pin1, HIGH);
     digitalWrite(m2Pin2, LOW);
 }
 
-void rightTurn()
+void rightTurnMotor()
 {
-    // その場旋回する例
+    Serial.println("Motor: RightTurn");
+    // その場旋回例
     digitalWrite(m1Pin1, HIGH);
     digitalWrite(m1Pin2, LOW);
     digitalWrite(m2Pin1, HIGH);
     digitalWrite(m2Pin2, LOW);
 }
 
-void leftTurn()
+void leftTurnMotor()
 {
-    // その場旋回する例
+    Serial.println("Motor: LeftTurn");
     digitalWrite(m1Pin1, LOW);
     digitalWrite(m1Pin2, HIGH);
     digitalWrite(m2Pin1, LOW);
@@ -214,15 +335,13 @@ void leftTurn()
 
 void stopMotor()
 {
+    Serial.println("Motor: Stop");
     digitalWrite(m1Pin1, LOW);
     digitalWrite(m1Pin2, LOW);
     digitalWrite(m2Pin1, LOW);
     digitalWrite(m2Pin2, LOW);
 }
 
-// ==================
-// 超音波距離取得
-// ==================
 double read_distance1()
 {
     digitalWrite(TRIG1, HIGH);

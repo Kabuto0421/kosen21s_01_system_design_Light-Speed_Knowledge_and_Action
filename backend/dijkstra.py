@@ -13,9 +13,9 @@ COM_PORT_LED2  = "/dev/tty.ESP32_LED_Control_2_ver2"
 BAUD_RATE = 115200
 
 # ======= グローバル変数（有効/無効のフラグ） =======
-MOTOR_ENABLED = True  # TrueならモーターESP32を使う
-LED1_ENABLED  = True   # TrueならLED1 ESP32を使う
-LED2_ENABLED  = True  # TrueならLED2 ESP32を使う(テスト時にOFF)
+MOTOR_ENABLED = False  # TrueならモーターESP32を使う
+LED1_ENABLED  = False   # TrueならLED1 ESP32を使う
+LED2_ENABLED  = False  # TrueならLED2 ESP32を使う(テスト時にOFF)
 
 # ======= グローバル変数（シリアルオブジェクト） =======
 ser_motor = None
@@ -135,14 +135,15 @@ def send_command_motor(command):
 
 def decide_directions(graph, path):
     """
-    経路に基づいて移動方向('straight', 'left', 'right')のリストを作成する。
-    2つ先の差分ベクトルから cross_product を計算して左右を判断。
+    経路に基づいて移動方向('straight', 'left', 'right')のリストを作成。
+    2つ先の差分ベクトルで cross_product を求めて左右を判断。
+    さらに、left/right の後には必ず straight を挟むようにする。
     """
     path_node_positions = [graph.positions[node] for node in path]
     deltas = []
     actions = []
 
-    # ノード同士の差分ベクトルを算出
+    # ノード同士の差分ベクトル
     for i in range(len(path_node_positions) - 1):
         pos1 = path_node_positions[i]
         pos2 = path_node_positions[i + 1]
@@ -150,20 +151,33 @@ def decide_directions(graph, path):
         delta_y = pos2[1] - pos1[1]
         deltas.append((delta_x, delta_y))
 
-    # 差分ベクトル間の外積 cross_product を用いて、左/右/直進 を決定
     for i in range(len(deltas) - 1):
         delta1 = deltas[i]
         delta2 = deltas[i + 1]
         cross_product = delta1[0] * delta2[1] - delta1[1] * delta2[0]
 
-        if cross_product == 0:
+        # ほぼ同じ向き（Δがほぼ0）なら straight
+        if abs(cross_product) < 1e-5:
             actions.append("straight")
         elif cross_product > 0:
             actions.append("left")
         else:
             actions.append("right")
 
-    return actions
+    # ---- ここで後処理 ----
+    # 「left/right のあとには必ず straight を入れたい」場合、
+    # actions の各要素を走査して、left/rightなら直後に straight を挿入した新リストを作る
+    final_actions = []
+    for action in actions:
+        final_actions.append(action)
+        if action in ["left", "right"]:
+            final_actions.append("straight")
+
+    # 初手で straight を1個入れたければ prepend
+    if len(final_actions) > 0:
+        final_actions.insert(0, "straight")
+
+    return final_actions
 
 # =========================
 # LED制御用 関数
@@ -198,6 +212,7 @@ def send_edges_to_led_controllers(used_edges):
 # =========================
 # 非同期のモニタリング関数
 # =========================
+'''
 async def monitor_and_respond(graph, path):
     actions = decide_directions(graph, path)
 
@@ -227,15 +242,19 @@ async def monitor_and_respond(graph, path):
             send_command_motor(action)
 
             # 左右旋回の場合は一定時間後に straight を送る (例)
-            if action in ["right", "left"]:
-                await asyncio.sleep(1.45)
+            if action == "left":
+                await asyncio.sleep(1.4513)  # 左折の後の待機時間
                 send_command_motor("straight")
-                print("3秒後に straight を送信")
+                print("1.4513秒後に straight を送信")
+            elif action == "right":
+                await asyncio.sleep(1.45)  # 右折の後の待機時間
+                send_command_motor("straight")
+                print("1.45秒後に straight を送信")
 
             path_index += 1
 
     print("GOAL地点に到達しました。経路上のコマンド送信を終了します。")
-
+'''
 
 # =========================
 # ベースグラフ (固定ノード・固定エッジ)
@@ -342,7 +361,15 @@ async def handle_connection(websocket):
 
                 # 3) 車用ESP32へモータ命令 (monitor_and_respond)
                 if MOTOR_ENABLED:
-                    await monitor_and_respond(graph, path)
+
+                    ser_motor.write(b"delay=1120\n") 
+
+                    actions = decide_directions(graph, path)
+                    # 例: ["straight","straight","left","straight", ...]
+                    # すべてを一度に送る(カンマ区切り)
+                    command_str = ",".join(actions) + "\n"
+                    ser_motor.write(command_str.encode("utf-8"))
+                    print(f"[SEND to MOTOR] {command_str.strip()}")
             else:
                 response = {"error": "Path not found or path is too short"}
                 await websocket.send(json.dumps(response))
@@ -402,7 +429,8 @@ async def main():
                 ser_led2.close()
             # MOTOR
             if MOTOR_ENABLED and ser_motor and ser_motor.is_open:
-                send_command_motor("stop")
+                # 停止コマンド
+                ser_motor.write(b"stop\n")
                 time.sleep(0.3)
                 ser_motor.close()
             print("Close All Ports")

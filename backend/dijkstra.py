@@ -13,7 +13,7 @@ COM_PORT_LED2  = "/dev/tty.ESP32_LED_Control_2_ver2"
 BAUD_RATE = 115200
 
 # ======= グローバル変数（有効/無効のフラグ） =======
-MOTOR_ENABLED = False  # TrueならモーターESP32を使う
+MOTOR_ENABLED = False # TrueならモーターESP32を使う
 LED1_ENABLED  = False   # TrueならLED1 ESP32を使う
 LED2_ENABLED  = False  # TrueならLED2 ESP32を使う(テスト時にOFF)
 
@@ -82,36 +82,46 @@ class Graph:
         self.edges[node1] = [(n, w) for (n, w) in self.edges[node1] if n != node2]
         self.edges[node2] = [(n, w) for (n, w) in self.edges[node2] if n != node1]
 
-def Dijkstra(graph, start):
+def dijkstra_all(graph, start):
+    """
+    各ノードに対して、最短距離となる全ての前駆ノードをリストで保持するDijkstraの改造版。
+    """
     S = []
     distances = {node: np.inf for node in graph.nodes}
     distances[start] = 0
-    previous_node = {node: None for node in graph.nodes}
+    # 各ノードの前駆ノードをリストで保持する
+    prev_nodes = {node: [] for node in graph.nodes}
 
     while len(S) < len(graph.nodes):
         notin_S = [node for node in graph.nodes if node not in S]
         current_node = min(notin_S, key=lambda node: distances[node])
         S.append(current_node)
 
-        for neighboring_node, weight in graph.edges[current_node]:
-            if neighboring_node not in S:
+        for neighbor, weight in graph.edges[current_node]:
+            if neighbor not in S:
                 new_dist = distances[current_node] + weight
-                if new_dist < distances[neighboring_node]:
-                    distances[neighboring_node] = new_dist
-                    previous_node[neighboring_node] = current_node
+                if new_dist < distances[neighbor]:
+                    distances[neighbor] = new_dist
+                    prev_nodes[neighbor] = [current_node]  # 新たにリストを置き換え
+                elif new_dist == distances[neighbor]:
+                    # 同じ距離が見つかった場合、前駆ノードを追加する
+                    prev_nodes[neighbor].append(current_node)
+    return distances, prev_nodes
 
-    return distances, previous_node
-
-def restore_path(previous_node, start, goal):
-    path = []
-    current_node = goal
-    while current_node is not None:
-        path.append(current_node)
-        if current_node == start:
-            break
-        current_node = previous_node[current_node]
-    path.reverse()
-    return path
+def enumerate_all_paths(prev_nodes, start, goal):
+    """
+    prev_nodes は dijkstra_all で得られた、各ノードの前駆ノードのリストを持つ辞書。
+    startからgoalまでのすべての経路（ノード列）を再帰的に列挙する。
+    """
+    def _recurse(current):
+        if current == start:
+            return [[start]]
+        paths = []
+        for pred in prev_nodes[current]:
+            for path in _recurse(pred):
+                paths.append(path + [current])
+        return paths
+    return _recurse(goal)
 
 # =========================
 # 送信用 関数 (モーター用)
@@ -326,34 +336,55 @@ async def handle_connection(websocket):
             # ベースグラフをコピー
             graph = copy.deepcopy(BASE_G)
 
-            # 指定エッジを削除
+            # 指定エッジの削除
             for edge_str in remove_edges:
                 node1, node2 = edge_str.split('-')
                 if node1 in graph.edges and node2 in graph.edges:
                     print(f"→ エッジ削除: {node1} - {node2}")
                     graph.delete_edge(node1, node2)
 
-            # Dijkstra で経路計算
-            distances, previous_node = Dijkstra(graph, start)
-            path = restore_path(previous_node, start, goal)
+            # dijkstra_all による経路計算
+            distances, prev_nodes = dijkstra_all(graph, start)
+            candidate_paths = enumerate_all_paths(prev_nodes, start, goal)
 
-            # 経路が見つかれば
-            if path and len(path) > 1:
-                print("Path found. Now sending response to p5.js and commands to ESP32...")
-                # 1) p5.js に path を返す
-                response = {"path": path}
+            if candidate_paths and len(candidate_paths[0]) > 1:
+                print("最短経路の候補が見つかった。JS側に候補経路を送信する。フハハ")
+                # 各候補経路に対応するエッジ情報も作成（必要に応じて）
+                candidate_edges = []
+                for path in candidate_paths:
+                    used_edges = []
+                    for i in range(len(path) - 1):
+                        n1, n2 = path[i], path[i+1]
+                        if (n1, n2) in EDGE_NUM_MAP:
+                            used_edges.append(EDGE_NUM_MAP[(n1, n2)])
+                    candidate_edges.append(used_edges)
+                
+                # JS側に候補経路と対応するエッジ情報を送信する
+                response = {
+                    "candidate_paths": candidate_paths,
+                    "candidate_edges": candidate_edges
+                }
                 await websocket.send(json.dumps(response))
+                print("[WS送信] 複数の候補経路を送信した。JS側の選択を待機する。")
 
-                # 2) LED制御用ESP32へも同じパス情報を送る
-
-                # ここで最終的に通った「エッジ番号」を抽出
+                # JS側から選択結果を受信する
+                selection_msg = await websocket.recv()
+                selection_data = json.loads(selection_msg)
+                if "selected_path" in selection_data:
+                    selected_path = selection_data["selected_path"]
+                    print(f"JS側から選択された経路: {selected_path}")
+                else:
+                    # 選択情報がなければ、デフォルトで最初の候補を使用する
+                    selected_path = candidate_paths[0]
+                    print("選択情報が受信できなかったので、デフォルトの経路を使用する。")
+                
+                # LED制御用ESP32へ送るエッジ情報は、選択された経路から算出
                 used_edges = []
-                for i in range(len(path)-1):
-                    n1 = path[i]
-                    n2 = path[i+1]
+                for i in range(len(selected_path)-1):
+                    n1 = selected_path[i]
+                    n2 = selected_path[i+1]
                     if (n1, n2) in EDGE_NUM_MAP:
-                        edge_num = EDGE_NUM_MAP[(n1, n2)]
-                        used_edges.append(edge_num)
+                        used_edges.append(EDGE_NUM_MAP[(n1, n2)])
 
                 # LED制御用ESP32へ送る
                 if LED1_ENABLED or LED2_ENABLED:
